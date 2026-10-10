@@ -1,0 +1,291 @@
+%%bash
+
+# 1. Create a sample text file to process
+cat << 'EOF' > sample.txt
+Hello world! This is a test file for the pthreads program.
+Pthreads make processing large files very fast! Hello again, world.
+EOF
+
+# 2. Write your C code to main.c
+cat << 'EOF' > main.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <string.h>
+#include <ctype.h>
+
+#define MAX_WORD_LEN 100
+#define INITIAL_CAPACITY 1024
+#define CHUNK_SIZE 4096 // 4KB chunks for dynamic slicing
+
+// Data structures
+typedef struct {
+    char word[MAX_WORD_LEN];
+    int count;
+} WordEntry;
+
+typedef struct {
+    WordEntry* entries;
+    int size;
+    int capacity;
+} WordMap;
+
+typedef struct {
+    int thread_id;
+    const char* file_path;
+    WordMap local_map;
+} ThreadData;
+
+// Global variables for final merge
+WordMap global_map;
+pthread_mutex_t map_mutex;
+
+// Global variables for dynamic slicing
+long global_file_offset = 0;
+long total_file_size = 0;
+pthread_mutex_t offset_mutex;
+
+// Function prototypes
+void init_map(WordMap* map);
+void add_word(WordMap* map, const char* word);
+void merge_map(WordMap* dest, WordMap* src);
+void free_map(WordMap* map);
+void normalize_word(char* word);
+void* process_chunk(void* arg);
+int compare_entries(const void* a, const void* b);
+
+// Initialization
+void init_map(WordMap* map) {
+    map->capacity = INITIAL_CAPACITY;
+    map->size = 0;
+    map->entries = (WordEntry*)malloc(map->capacity * sizeof(WordEntry));
+}
+
+// Add or update word count
+void add_word(WordMap* map, const char* word) {
+    for (int i = 0; i < map->size; i++) {
+        if (strcmp(map->entries[i].word, word) == 0) {
+            map->entries[i].count++;
+            return;
+        }
+    }
+    // Resize if necessary
+    if (map->size >= map->capacity) {
+        map->capacity *= 2;
+        map->entries = (WordEntry*)realloc(map->entries, map->capacity * sizeof(WordEntry));
+    }
+    strcpy(map->entries[map->size].word, word);
+    map->entries[map->size].count = 1;
+    map->size++;
+}
+
+// Merge src map into dest map safely (called with mutex held)
+void merge_map(WordMap* dest, WordMap* src) {
+    for (int i = 0; i < src->size; i++) {
+        int found = 0;
+        for (int j = 0; j < dest->size; j++) {
+            if (strcmp(dest->entries[j].word, src->entries[i].word) == 0) {
+                dest->entries[j].count += src->entries[i].count;
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            if (dest->size >= dest->capacity) {
+                dest->capacity *= 2;
+                dest->entries = (WordEntry*)realloc(dest->entries, dest->capacity * sizeof(WordEntry));
+            }
+            strcpy(dest->entries[dest->size].word, src->entries[i].word);
+            dest->entries[dest->size].count = src->entries[i].count;
+            dest->size++;
+        }
+    }
+}
+
+// Free memory
+void free_map(WordMap* map) {
+    free(map->entries);
+}
+
+// Normalize word (to lowercase, strip punctuation)
+void normalize_word(char* word) {
+    int i = 0, j = 0;
+    while (word[i]) {
+        if (isalpha(word[i])) {
+            word[j++] = tolower(word[i]);
+        }
+        i++;
+    }
+    word[j] = '\0';
+}
+
+// Thread function (Dynamic Slicing Implementation)
+void* process_chunk(void* arg) {
+    ThreadData* data = (ThreadData*)arg;
+    init_map(&data->local_map);
+
+    FILE* file = fopen(data->file_path, "r");
+    if (!file) {
+        fprintf(stderr, "Thread %d: Failed to open file\n", data->thread_id);
+        pthread_exit(NULL);
+    }
+
+    while (1) {
+        // --- DYNAMIC SLICING ---
+        // Lock mutex, grab a chunk, increment global offset, unlock
+        pthread_mutex_lock(&offset_mutex);
+        long start_offset = global_file_offset;
+        
+        if (start_offset >= total_file_size) {
+            pthread_mutex_unlock(&offset_mutex);
+            break; // No more data to process
+        }
+        
+        long end_offset = start_offset + CHUNK_SIZE;
+        if (end_offset > total_file_size) {
+            end_offset = total_file_size;
+        }
+        
+        global_file_offset = end_offset; // Update for the next thread
+        pthread_mutex_unlock(&offset_mutex);
+
+        // Process this specific chunk
+        fseek(file, start_offset, SEEK_SET);
+
+        // If we are not at the very beginning of the file, we might be inside a word.
+        // Read until we hit whitespace to skip the partial word (previous chunk handled it).
+        if (start_offset > 0) {
+            int c;
+            while ((c = fgetc(file)) != EOF) {
+                if (isspace(c)) break;
+            }
+        }
+
+        char word_buf[MAX_WORD_LEN];
+        // Read words until we cross our end_offset boundary
+        while (ftell(file) < end_offset && fscanf(file, "%99s", word_buf) == 1) {
+            normalize_word(word_buf);
+            if (strlen(word_buf) > 0) {
+                add_word(&data->local_map, word_buf);
+            }
+        }
+    }
+
+    fclose(file);
+
+    // Synchronize and merge into global map
+    pthread_mutex_lock(&map_mutex);
+    merge_map(&global_map, &data->local_map);
+    pthread_mutex_unlock(&map_mutex);
+
+    // Free local map as its data is now merged
+    free_map(&data->local_map);
+
+    pthread_exit(NULL);
+}
+
+// Sort by frequency (descending)
+int compare_entries(const void* a, const void* b) {
+    WordEntry* w1 = (WordEntry*)a;
+    WordEntry* w2 = (WordEntry*)b;
+    if (w2->count == w1->count) {
+        return strcmp(w1->word, w2->word); // Alphabetical tie-breaker
+    }
+    return w2->count - w1->count;
+}
+
+int main(int argc, char* argv[]) {
+    if (argc != 3) {
+        printf("Usage: %s <file_path> <num_threads>\n", argv[0]);
+        return 1;
+    }
+
+    const char* file_path = argv[1];
+    int num_threads = atoi(argv[2]);
+
+    if (num_threads <= 0) {
+        printf("Error: Invalid number of threads.\n");
+        return 1;
+    }
+
+    FILE* file = fopen(file_path, "r");
+    if (!file) {
+        printf("Error: Could not open file %s\n", file_path);
+        return 1;
+    }
+
+    fseek(file, 0, SEEK_END);
+    total_file_size = ftell(file);
+    fclose(file);
+
+    if (total_file_size == 0) {
+        printf("File is empty.\n");
+        return 0;
+    }
+
+    // Initialize global structures and mutexes
+    init_map(&global_map);
+    pthread_mutex_init(&map_mutex, NULL);
+    pthread_mutex_init(&offset_mutex, NULL);
+
+    pthread_t* threads = (pthread_t*)malloc(num_threads * sizeof(pthread_t));
+    ThreadData* thread_data = (ThreadData*)malloc(num_threads * sizeof(ThreadData));
+
+    printf("Counting with %d threads...\n", num_threads);
+
+    for (int i = 0; i < num_threads; i++) {
+        thread_data[i].thread_id = i;
+        thread_data[i].file_path = file_path;
+        pthread_create(&threads[i], NULL, process_chunk, (void*)&thread_data[i]);
+    }
+
+    for (int i = 0; i < num_threads; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    // Sort global map
+    qsort(global_map.entries, global_map.size, sizeof(WordEntry), compare_entries);
+
+    // Write results to results/result.txt or result.txt (if results directory doesn't exist)
+    FILE* out_file = fopen("results/result.txt", "w");
+    if (!out_file) {
+        out_file = fopen("result.txt", "w"); // Fallback
+    }
+
+    if (out_file) {
+        fprintf(out_file, "%-20s %s\n", "WORD", "COUNT");
+        for (int i = 0; i < global_map.size; i++) {
+            fprintf(out_file, "%-20s %d\n", global_map.entries[i].word, global_map.entries[i].count);
+        }
+        fclose(out_file);
+        printf("Done. %d unique words -> result.txt\n", global_map.size);
+    } else {
+        printf("Error: Could not write output file.\n");
+    }
+
+    // Cleanup
+    free_map(&global_map);
+    free(threads);
+    free(thread_data);
+    pthread_mutex_destroy(&map_mutex);
+    pthread_mutex_destroy(&offset_mutex);
+
+    return 0;
+}
+EOF
+
+# 3. Compile the C program
+echo "Compiling..."
+gcc main.c -o main -pthread
+
+# 4. Run the program with the sample file and 4 threads
+echo "Running..."
+./main sample.txt 4
+
+# 5. Display the first 20 results
+echo -e "\n--- OUTPUT ---"
+if [ -f "results/result.txt" ]; then
+    head -20 results/result.txt
+else
+    head -20 result.txt
+fi

@@ -1,0 +1,190 @@
+%%bash
+
+# 1. Prepare dependencies (Download stb_image headers)
+mkdir -p ../include
+wget -q https://raw.githubusercontent.com/nothings/stb/master/stb_image.h -O ../include/stb_image.h
+wget -q https://raw.githubusercontent.com/nothings/stb/master/stb_image_write.h -O ../include/stb_image_write.h
+
+# 2. Download sample images to test with
+wget -q https://raw.githubusercontent.com/LankLaki/HPC-project-images/main/gray.jpeg -O gray.jpeg
+wget -q https://raw.githubusercontent.com/LankLaki/HPC-project-images/main/grayscale-v1.png -O grayscale-v1.png
+wget -q https://raw.githubusercontent.com/LankLaki/HPC-project-images/main/mirrordog.jpg -O mirrordog.jpg
+
+# 3. Write your CUDA Sobel code to main.cu
+cat << 'EOF' > main.cu
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <cuda_runtime.h>
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "../include/stb_image.h"
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "../include/stb_image_write.h"
+
+// CUDA Error Checking Macro
+#define cudaCheckError() { \
+    cudaError_t e=cudaGetLastError(); \
+    if(e!=cudaSuccess) { \
+        printf("CUDA Error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(e)); \
+        exit(1); \
+    } \
+}
+
+// -------------------------------------------------------------------------
+// SOBEL EDGE DETECTION KERNEL (Zero Padding Implemented)
+// -------------------------------------------------------------------------
+__global__ void sobel_kernel(unsigned char* d_in, unsigned char* d_out, int width, int height) {
+    // 2D Thread Mapping
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x < width && y < height) {
+        // Standard Sobel Kernels
+        int Gx_kernel[3][3] = {
+            {-1, 0, 1},
+            {-2, 0, 2},
+            {-1, 0, 1}
+        };
+        int Gy_kernel[3][3] = {
+            {-1, -2, -1},
+            { 0,  0,  0},
+            { 1,  2,  1}
+        };
+
+        float sumX = 0;
+        float sumY = 0;
+
+        // Apply 3x3 convolution
+        for (int ky = -1; ky <= 1; ky++) {
+            for (int kx = -1; kx <= 1; kx++) {
+                int nx = x + kx;
+                int ny = y + ky;
+
+                // --- ZERO PADDING ---
+                // If the neighbour is outside the image bounds, the pixel value is assumed 0.
+                int pixel_val = 0;
+                if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                    pixel_val = d_in[ny * width + nx];
+                }
+
+                sumX += pixel_val * Gx_kernel[ky + 1][kx + 1];
+                sumY += pixel_val * Gy_kernel[ky + 1][kx + 1];
+            }
+        }
+
+        // Calculate final gradient magnitude: G = sqrt(Gx^2 + Gy^2)
+        float magnitude = sqrt(sumX * sumX + sumY * sumY);
+        
+        // Clamp to 0-255 boundary for standard 8-bit image
+        if (magnitude > 255.0f) magnitude = 255.0f;
+        if (magnitude < 0.0f) magnitude = 0.0f;
+
+        d_out[y * width + x] = (unsigned char)magnitude;
+    }
+}
+
+// Extract filename from path for saving
+const char* get_filename_ext(const char *filename) {
+    const char *dot = strrchr(filename, '\\');
+    if(!dot || dot == filename) {
+        dot = strrchr(filename, '/');
+    }
+    if(!dot || dot == filename) return filename;
+    return dot + 1;
+}
+
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        printf("Usage: %s <image1.png> [image2.png] ...\n", argv[0]);
+        return 1;
+    }
+
+    // Ensure results directory exists
+    system("mkdir -p results");
+
+    // Loop through all images provided on the command line
+    for (int i = 1; i < argc; i++) {
+        const char* input_file = argv[i];
+        printf("\nProcessing Image: %s\n", input_file);
+
+        int width, height, original_channels;
+        
+        // --- 1. Read Image to CPU Memory ---
+        // We force desired_channels = 1 to automatically convert to grayscale
+        // This makes edge detection mathematically straightforward as required.
+        unsigned char* h_in = stbi_load(input_file, &width, &height, &original_channels, 1);
+        
+        if (!h_in) {
+            printf("Error: Could not load image %s\n", input_file);
+            continue; // Skip to next image
+        }
+
+        printf("Dimensions: %d x %d\n", width, height);
+
+        size_t img_size = width * height * sizeof(unsigned char);
+        unsigned char* h_out = (unsigned char*)malloc(img_size);
+
+        // --- 2. Allocate GPU Memory ---
+        unsigned char *d_in, *d_out;
+        cudaMalloc((void**)&d_in, img_size);
+        cudaCheckError();
+
+        cudaMalloc((void**)&d_out, img_size);
+        cudaCheckError();
+
+        // Copy CPU image to GPU
+        cudaMemcpy(d_in, h_in, img_size, cudaMemcpyHostToDevice);
+        cudaCheckError();
+
+        // --- 3. 2D Block and Grid Configuration ---
+        dim3 threadsPerBlock(16, 16); // 256 threads per block
+        dim3 blocksPerGrid((width + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                           (height + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+        // --- 4. Execute Kernel ---
+        sobel_kernel<<<blocksPerGrid, threadsPerBlock>>>(d_in, d_out, width, height);
+        cudaDeviceSynchronize();
+        cudaCheckError();
+
+        // --- 5. Transfer Result Back to CPU ---
+        cudaMemcpy(h_out, d_out, img_size, cudaMemcpyDeviceToHost);
+        cudaCheckError();
+
+        // --- 6. Write Output Image ---
+        char output_file[512];
+        sprintf(output_file, "results/edge_%s", get_filename_ext(input_file));
+        
+        int write_success = stbi_write_png(output_file, width, height, 1, h_out, width);
+        if (write_success) {
+            printf("Success: Saved edge map to %s\n", output_file);
+        } else {
+            printf("Error: Failed to write image %s\n", output_file);
+        }
+
+        // --- 7. Memory Deallocation (Crucial Step) ---
+        cudaFree(d_in);
+        cudaFree(d_out);
+        stbi_image_free(h_in); // STB's specific free function
+        free(h_out);
+    }
+
+    printf("\nAll images processed successfully.\n");
+    return 0;
+}
+EOF
+
+# 4. Compile the CUDA program
+echo "Compiling CUDA Sobel Edge Detection code..."
+# Use nvcc to compile .cu files (Make sure you are using a T4 GPU runtime!)
+/usr/local/cuda/bin/nvcc main.cu -o main -lm -diag-suppress 550
+
+# 5. Create results directory
+mkdir -p results
+
+# 6. Run the program with the sample images
+echo "Running..."
+./main gray.jpeg grayscale-v1.png mirrordog.jpg
+
+
